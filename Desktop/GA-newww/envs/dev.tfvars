@@ -28,5 +28,4 @@ common_tags = {
   Owner      = "platform-team"
   CostCenter = "cc-dev-001"
   Tier       = "development"
-  created_by = "terraform"
 }
