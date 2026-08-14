@@ -1,0 +1,180 @@
+# ============================================================
+# dev-plan.yml — Terraform Plan for DEV Environment
+#
+# TRIGGER:  Pull Request → 'dev' branch
+# PRODUCES: Binary tfplan artifact uploaded to GitHub Actions
+#
+# KEY DESIGN DECISIONS:
+#   1. OIDC: Exchanges GitHub token for temporary AWS credentials
+#      via the IAM role created in oidc/main.tf (dev role)
+#   2. STATE ISOLATION: -backend-config="key=dev/terraform.tfstate"
+#      ensures Dev never touches QA or Prod state
+#   3. TFVARS: envs/dev.tfvars supplies environment-specific values
+#   4. ARTIFACT: Binary tfplan is uploaded so dev-apply.yml can
+#      apply EXACTLY what was reviewed — no re-plan on apply
+# ============================================================
+
+name: "🔍 DEV — Terraform Plan"
+
+on:
+  pull_request:
+    branches:
+      - dev
+
+permissions:
+  id-token: write      # Required to generate OIDC token for AWS
+  contents: read       # Required to checkout repository
+  pull-requests: write # Required to post plan as PR comment
+
+concurrency:
+  group: "terraform-dev-plan-pr${{ github.event.pull_request.number }}"
+  cancel-in-progress: true # Cancel stale plan when new commits are pushed
+
+env:
+  TF_VERSION:          "1.10.3"
+  TF_WORKING_DIR:      "terraform"
+  TF_VAR_FILE:         "envs/dev.tfvars"
+  TF_STATE_KEY:        "dev/terraform.tfstate"
+  TF_INPUT:            "false"
+  TF_CLI_ARGS:         "-no-color"
+  TF_PLUGIN_CACHE_DIR: "${{ github.workspace }}/.terraform.d/plugin-cache"
+
+jobs:
+  terraform-plan:
+    name: "Plan — DEV"
+    runs-on: ubuntu-latest
+    environment: Development  # Links to GitHub Environment for secrets
+
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────────
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # ── 2. Plugin Cache ───────────────────────────────────────────────────────
+      - name: "💾 Cache Terraform Plugins"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: "${{ runner.os }}-tf-${{ hashFiles('**/.terraform.lock.hcl') }}"
+          restore-keys: "${{ runner.os }}-tf-"
+
+      - name: "📁 Create Plugin Cache Dir"
+        run: mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+        working-directory: ${{ github.workspace }}
+
+      # ── 3. Setup Terraform ────────────────────────────────────────────────────
+      - name: "⚙️ Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # ── 4. AWS Auth via OIDC ──────────────────────────────────────────────────
+      # The IAM role ARN comes from the GitHub Environment secret.
+      # This role was created by running `terraform apply` in the oidc/ folder.
+      # It only allows assumption from this repo's dev branch / PRs.
+      - name: "🔐 Configure AWS Credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: "GitHubActions-Dev-Plan-${{ github.run_id }}"
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 3600
+
+      # ── 5. Terraform Init — Dynamic State Key ─────────────────────────────────
+      # Partial backend: 'key' is injected here to isolate Dev state
+      - name: "🚀 Terraform Init"
+        id: init
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="key=${{ env.TF_STATE_KEY }}"
+
+      # ── 6. Format Check ───────────────────────────────────────────────────────
+      - name: "✨ Terraform Format Check"
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ github.workspace }}
+
+      # ── 7. Validate ───────────────────────────────────────────────────────────
+      - name: "✅ Terraform Validate"
+        id: validate
+        run: terraform validate
+
+      # ── 8. Plan — using envs/dev.tfvars ──────────────────────────────────────
+      # envs/dev.tfvars provides all env-specific values (instance_type, subnet_id, etc.)
+      - name: "📋 Terraform Plan"
+        id: plan
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -detailed-exitcode \
+            -var-file="${{ github.workspace }}/${{ env.TF_VAR_FILE }}"
+        continue-on-error: true # exit code 2 = changes detected (not an error)
+
+      # ── 9. Human-readable plan ────────────────────────────────────────────────
+      - name: "📄 Generate plan.txt"
+        run: terraform show -no-color tfplan > plan.txt
+
+      # ── 10. Upload Artifact ───────────────────────────────────────────────────
+      # The apply workflow downloads this exact artifact — no re-plan
+      - name: "📤 Upload Plan Artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "tfplan-dev-pr${{ github.event.pull_request.number }}"
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/plan.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      # ── 11. PR Comment ────────────────────────────────────────────────────────
+      - name: "💬 Post Plan to PR"
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        env:
+          PLAN_EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let plan = '';
+            try { plan = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan.txt', 'utf8'); } catch { plan = '_Plan output unavailable_'; }
+            if (plan.length > 60000) plan = plan.substring(0, 60000) + '\n\n_(truncated — view full artifact in Actions)_';
+            const code = process.env.PLAN_EXITCODE;
+            const status = code === '0' ? '✅ No Changes' : code === '2' ? '🔄 Changes Detected' : '❌ Plan Failed';
+            const body = `## 🔍 Terraform Plan — **DEV** Environment
+            | Item | Value |
+            |---|---|
+            | **Status** | ${status} |
+            | **Branch** | \`${{ github.head_ref }}\` → \`dev\` |
+            | **Commit** | \`${{ github.event.pull_request.head.sha }}\` |
+            | **Artifact** | \`tfplan-dev-pr${{ github.event.pull_request.number }}\` |
+            | **Workflow** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+            <details><summary>📋 Expand Plan Output</summary>
+
+            \`\`\`hcl
+            ${plan}
+            \`\`\`
+            </details>
+
+            > ⚠️ **Review plan carefully. On merge, \`dev-apply.yml\` will apply this artifact to AWS DEV.**`;
+            const { data: comments } = await github.rest.issues.listComments({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes('Terraform Plan — **DEV**'));
+            if (existing) await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+
+      # ── 12. Fail on Error ─────────────────────────────────────────────────────
+      - name: "🚨 Fail if Plan Errored"
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "❌ Terraform plan exited with code 1 (error). Fix issues above."
+          exit 1

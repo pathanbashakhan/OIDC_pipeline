@@ -1,0 +1,108 @@
+# ============================================================
+# dev-apply.yml — Terraform Apply for DEV Environment
+#
+# TRIGGER:  Push to 'dev' branch (PR merged)
+# CONSUMES: tfplan artifact produced by dev-plan.yml
+#
+# CRITICAL: Downloads the exact binary plan artifact from the
+# merged PR — this guarantees no drift between reviewed plan
+# and what actually gets applied.
+# ============================================================
+
+name: "🚀 DEV — Terraform Apply"
+
+on:
+  push:
+    branches:
+      - dev
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: "terraform-dev-apply"
+  cancel-in-progress: false # NEVER cancel an in-progress apply
+
+env:
+  TF_VERSION:          "1.10.3"
+  TF_WORKING_DIR:      "terraform"
+  TF_VAR_FILE:         "envs/dev.tfvars"
+  TF_STATE_KEY:        "dev/terraform.tfstate"
+  TF_INPUT:            "false"
+  TF_CLI_ARGS:         "-no-color"
+  TF_PLUGIN_CACHE_DIR: "${{ github.workspace }}/.terraform.d/plugin-cache"
+
+jobs:
+  terraform-apply:
+    name: "Apply — DEV"
+    runs-on: ubuntu-latest
+    environment: Development
+
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "💾 Cache Terraform Plugins"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: "${{ runner.os }}-tf-${{ hashFiles('**/.terraform.lock.hcl') }}"
+          restore-keys: "${{ runner.os }}-tf-"
+
+      - name: "📁 Create Plugin Cache Dir"
+        run: mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+        working-directory: ${{ github.workspace }}
+
+      - name: "⚙️ Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # Uses the DEV IAM role (created in oidc/main.tf)
+      - name: "🔐 Configure AWS Credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: "GitHubActions-Dev-Apply-${{ github.run_id }}"
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 3600
+
+      # Find the PR number whose merge triggered this push
+      - name: "🔎 Get Merged PR Number"
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: pulls } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha,
+            });
+            const pr = pulls.find(p => p.merged_at && p.base.ref === 'dev');
+            if (!pr) { core.setFailed('No merged PR found for commit.'); return; }
+            console.log(`Merged PR: #${pr.number}`);
+            core.setOutput('pr_number', pr.number);
+
+      # Download the EXACT artifact reviewed in the PR — no re-plan
+      - name: "📥 Download Plan Artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: "tfplan-dev-pr${{ steps.pr.outputs.pr_number }}"
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: "🚀 Terraform Init"
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="key=${{ env.TF_STATE_KEY }}"
+
+      - name: "✅ Terraform Apply"
+        run: terraform apply -auto-approve tfplan
+
+      - name: "📊 Show Outputs"
+        run: terraform output

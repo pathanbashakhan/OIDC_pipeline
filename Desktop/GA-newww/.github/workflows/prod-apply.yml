@@ -1,0 +1,101 @@
+# ============================================================
+# prod-apply.yml — Terraform Apply for PRODUCTION Environment
+# TRIGGER: Push to 'prod' branch (qa → prod PR merged)
+#
+# EXTRA SAFEGUARD: environment: Production gate pauses this job
+# until a designated reviewer explicitly approves in the UI.
+# ============================================================
+
+name: "🚀 PROD — Terraform Apply"
+
+on:
+  push:
+    branches:
+      - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: "terraform-prod-apply"
+  cancel-in-progress: false # NEVER cancel a production apply
+
+env:
+  TF_VERSION:          "1.10.3"
+  TF_WORKING_DIR:      "terraform"
+  TF_VAR_FILE:         "envs/prod.tfvars"
+  TF_STATE_KEY:        "prod/terraform.tfstate"
+  TF_INPUT:            "false"
+  TF_CLI_ARGS:         "-no-color"
+  TF_PLUGIN_CACHE_DIR: "${{ github.workspace }}/.terraform.d/plugin-cache"
+
+jobs:
+  terraform-apply:
+    name: "Apply — PROD"
+    runs-on: ubuntu-latest
+    environment: Production  # ⭐ Requires designated reviewer approval before running
+
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "💾 Cache Terraform Plugins"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: "${{ runner.os }}-tf-${{ hashFiles('**/.terraform.lock.hcl') }}"
+          restore-keys: "${{ runner.os }}-tf-"
+
+      - name: "📁 Create Plugin Cache Dir"
+        run: mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+        working-directory: ${{ github.workspace }}
+
+      - name: "⚙️ Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      - name: "🔐 Configure AWS Credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: "GitHubActions-Prod-Apply-${{ github.run_id }}"
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 3600
+
+      - name: "🔎 Get Merged PR Number"
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: pulls } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha,
+            });
+            const pr = pulls.find(p => p.merged_at && p.base.ref === 'prod');
+            if (!pr) { core.setFailed('No merged PR found.'); return; }
+            core.setOutput('pr_number', pr.number);
+
+      - name: "📥 Download Plan Artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: "tfplan-prod-pr${{ steps.pr.outputs.pr_number }}"
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: "🚀 Terraform Init"
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="key=${{ env.TF_STATE_KEY }}"
+
+      - name: "✅ Terraform Apply"
+        run: terraform apply -auto-approve tfplan
+
+      - name: "📊 Show Outputs"
+        run: terraform output

@@ -1,0 +1,25 @@
+# Terraform generated files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.lock.hcl
+
+# Sensitive variable files — never commit these
+*.auto.tfvars
+secrets.tfvars
+override.tf
+override.tf.json
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# GitHub Actions local test
+act/
